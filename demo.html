@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>CDP Human Input Demo</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: -apple-system, "Apple SD Gothic Neo", sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    overflow: hidden;
+  }
+  .container {
+    padding: 24px;
+    display: grid;
+    gap: 14px;
+    max-width: 720px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 2;
+  }
+  h1 { margin: 0; font-size: 20px; color: #93c5fd; }
+  .panel {
+    background: rgba(30, 41, 59, 0.85);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 14px 16px;
+    backdrop-filter: blur(4px);
+  }
+  label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; letter-spacing: 0.02em; }
+  input, textarea {
+    width: 100%;
+    background: #0f172a;
+    border: 1px solid #334155;
+    color: #f1f5f9;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 16px;
+    box-sizing: border-box;
+    font-family: inherit;
+  }
+  textarea { min-height: 70px; resize: vertical; }
+  input:focus, textarea:focus { outline: 0; border-color: #60a5fa; }
+  button {
+    background: #38bdf8;
+    color: #082f49;
+    border: 0;
+    border-radius: 8px;
+    padding: 12px 20px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.hit { background: #4ade80; transform: scale(1.03); }
+  #dot {
+    position: fixed;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #ef4444;
+    box-shadow: 0 0 18px #ef4444;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 999;
+    left: -100px; top: -100px;
+  }
+  canvas {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+    pointer-events: none;
+  }
+  #log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: #cbd5e1;
+    background: #020617;
+    padding: 10px;
+    border-radius: 8px;
+    height: 110px;
+    overflow: auto;
+    line-height: 1.5;
+  }
+  #log div.k { color: #fcd34d; }
+  #log div.c { color: #86efac; }
+</style>
+</head>
+<body>
+<canvas id="trace"></canvas>
+<div id="dot"></div>
+
+<div class="container">
+  <h1>CDP Human Input Demo</h1>
+
+  <div class="panel">
+    <label for="ko">한글 입력 (IME 자모 조합)</label>
+    <textarea id="ko" placeholder="여기에 자모 단위로 조합되며 들어갑니다"></textarea>
+  </div>
+
+  <div class="panel">
+    <label for="en">영문/숫자 (일반 keyDown)</label>
+    <input id="en" placeholder="여기는 영문 keyDown 경로" />
+  </div>
+
+  <div class="panel" style="display:flex; gap:12px; align-items:center;">
+    <button id="target">클릭 타겟</button>
+    <span id="clicked" style="font-size:13px; color:#94a3b8;"></span>
+  </div>
+
+  <div class="panel">
+    <label>이벤트 로그 (keydown / composition*)</label>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+  const ctx = document.getElementById("trace").getContext("2d");
+  const dot = document.getElementById("dot");
+  const log = document.getElementById("log");
+
+  function resize() {
+    const c = ctx.canvas;
+    c.width = innerWidth * devicePixelRatio;
+    c.height = innerHeight * devicePixelRatio;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    ctx.strokeStyle = "rgba(96, 165, 250, 0.75)";
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+  }
+  resize();
+  addEventListener("resize", resize);
+
+  let last = null;
+  addEventListener("mousemove", (e) => {
+    dot.style.left = e.clientX + "px";
+    dot.style.top = e.clientY + "px";
+    if (last) {
+      ctx.beginPath();
+      ctx.moveTo(last.x, last.y);
+      ctx.lineTo(e.clientX, e.clientY);
+      ctx.stroke();
+    }
+    last = { x: e.clientX, y: e.clientY };
+  });
+
+  function addLog(msg, cls) {
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = msg;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+    if (log.childElementCount > 200) log.firstChild.remove();
+  }
+
+  for (const el of document.querySelectorAll("input,textarea")) {
+    el.addEventListener("compositionstart", () => addLog(`[${el.id}] compositionstart`, "c"));
+    el.addEventListener("compositionupdate", (e) => addLog(`[${el.id}] compositionupdate "${e.data}"`, "c"));
+    el.addEventListener("compositionend", (e) => addLog(`[${el.id}] compositionend "${e.data}"`, "c"));
+    el.addEventListener("keydown", (e) => addLog(`[${el.id}] keydown code=${e.code} key="${e.key}" kc=${e.keyCode}`, "k"));
+  }
+
+  const btn = document.getElementById("target");
+  btn.addEventListener("click", () => {
+    btn.classList.add("hit");
+    document.getElementById("clicked").textContent = "clicked @ " + new Date().toLocaleTimeString();
+    setTimeout(() => btn.classList.remove("hit"), 600);
+  });
+</script>
+</body>
+</html>
