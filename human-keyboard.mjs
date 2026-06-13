@@ -1,33 +1,40 @@
-// human-keyboard.mjs
-// CDP(Input.* 도메인)로 사람처럼 키보드 입력을 시뮬레이션한다.
+// human-keyboard.mjs (v2)
+// CDP로 사람처럼 키보드 입력을 시뮬레이션한다.
 //
-//   - ASCII : keyDown + keyUp (text 필드로 글자 삽입)
-//   - 한글  : 두벌식 자모 단위로 IME 표준 keydown(keyCode 229) + imeSetComposition + insertText
-//   - 특수키: Enter, Tab, Backspace, 화살표 등
-//   - 간격  : WPM 기반 + jitter + 구두점/줄바꿈 후 추가 지연 + 간헐적 정지
-//   - 옵션  : typoChance로 인접 키 오타 후 백스페이스 정정
+// v2 개선점:
+//   - 페르소나 연동: 세션 = 한 사람. WPM/리듬/오타율/롤오버 성향이 일관됨
+//   - 로그정규 + AR(1) 리듬: 균등분포 대신 사람의 간격 분포 + 자기상관(리듬)
+//   - 키 롤오버: 빠른 연타 시 이전 키를 떼기 전에 다음 키를 누름(down1 down2 up1 up2)
+//   - digraph hold: 키 누름 시간이 키마다 다름(같은 손 연속은 느림 근사)
+//   - 오타 다양화: 인접 키 오타 + transposition(순서 바뀜) 후 정정
+//   - 한글: 두벌식 자모 IME 조합(keyCode 229 + imeSetComposition + insertText) 유지
+//   - 숫자/기호는 약간 느리게
 //
-// 사용:
-//   import { humanType, pressKey } from "./human-keyboard.mjs";
-//   const send = (m, p) => cdpSession.send(m, p);
-//   await humanType(send, "안녕하세요, Eric입니다.");
-//   await pressKey(send, "Enter");
+// send = (method, params) => Promise.
 
-// ============================================================
-// 유틸
-// ============================================================
+import { createPersona } from "./persona.mjs";
+import { clamp } from "./human-random.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const rand  = (lo, hi) => lo + Math.random() * (hi - lo);
 
-// modifiers 비트마스크: Alt=1, Ctrl=2, Meta=4, Shift=8
-function mods({ shift, ctrl, alt, meta } = {}) {
-  return (alt ? 1 : 0) | (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
+// ============================================================
+// 페르소나
+// ============================================================
+
+let activePersona = null;
+export function setPersona(persona) { activePersona = persona; }
+export function getPersona() {
+  if (!activePersona) activePersona = createPersona();
+  return activePersona;
 }
 
 // ============================================================
-// ASCII / 기호 키 매핑
+// modifiers / 키 매핑
 // ============================================================
+
+function mods({ shift, ctrl, alt, meta } = {}) {
+  return (alt ? 1 : 0) | (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
+}
 
 const SYM = {
   " ":  { code: "Space",        kc: 32  },
@@ -43,12 +50,15 @@ const SYM = {
   "/":  { code: "Slash",        kc: 191 },
   "`":  { code: "Backquote",    kc: 192 },
 };
-
-// Shift 조합으로 입력되는 기호 → 기반 키
 const SHIFTED = {
   "!":"1","@":"2","#":"3","$":"4","%":"5","^":"6","&":"7","*":"8","(":"9",")":"0",
   "_":"-","+":"=","{":"[","}":"]","|":"\\",":":";",'"':"'","<":",",">":".","?":"/","~":"`",
 };
+
+// 키가 속한 손 (롤오버/리듬 근사용). l=왼손, r=오른손
+const HAND = {};
+"qwertasdfgzxcvb12345".split("").forEach((c) => (HAND[c] = "l"));
+"yuiophjklnm67890".split("").forEach((c) => (HAND[c] = "r"));
 
 function charToKey(ch) {
   if (/^[a-z]$/.test(ch)) return { key: ch, code: `Key${ch.toUpperCase()}`, kc: ch.toUpperCase().charCodeAt(0), text: ch };
@@ -60,13 +70,8 @@ function charToKey(ch) {
     const info = SYM[base] ?? { code: `Digit${base}`, kc: base.charCodeAt(0) };
     return { key: ch, ...info, text: ch, shift: true };
   }
-  // 호환 자모(ㅋㅋ), 이모지 등 — IME 없이 텍스트만 삽입
   return { insertOnly: true, text: ch };
 }
-
-// ============================================================
-// 특수 키
-// ============================================================
 
 const SPECIAL = {
   Enter:      { code: "Enter",      kc: 13, text: "\r" },
@@ -95,7 +100,6 @@ const CHO  = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ".split("
 const JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ".split("");
 const JONG = ["", ..."ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ".split("")];
 
-// 두벌식에서 두 타에 걸쳐 입력되는 복합 자모
 const JUNG_COMPOUND = {
   "ㅘ":["ㅗ","ㅏ"], "ㅙ":["ㅗ","ㅐ"], "ㅚ":["ㅗ","ㅣ"],
   "ㅝ":["ㅜ","ㅓ"], "ㅞ":["ㅜ","ㅔ"], "ㅟ":["ㅜ","ㅣ"],
@@ -131,7 +135,6 @@ export function isHangulSyllable(ch) {
   return c >= HANGUL_BASE && c <= HANGUL_LAST;
 }
 
-/** 음절 → 단계별 화면 표시 시퀀스. 예: "안" → ["ㅇ","아","안"] */
 export function syllableToSteps(syllable) {
   const code    = syllable.charCodeAt(0) - HANGUL_BASE;
   const choIdx  = Math.floor(code / 588);
@@ -139,7 +142,6 @@ export function syllableToSteps(syllable) {
   const jongIdx = code % 28;
 
   const steps = [CHO[choIdx]];
-
   const jungSeq = JUNG_COMPOUND[JUNG[jungIdx]] ?? [JUNG[jungIdx]];
   let acc = "";
   for (const j of jungSeq) {
@@ -147,7 +149,6 @@ export function syllableToSteps(syllable) {
     const cur = JUNG.includes(acc) ? acc : JUNG_REV[acc];
     steps.push(String.fromCharCode(HANGUL_BASE + choIdx * 588 + JUNG.indexOf(cur) * 28));
   }
-
   if (jongIdx > 0) {
     const jongSeq = JONG_COMPOUND[JONG[jongIdx]] ?? [JONG[jongIdx]];
     let jacc = "";
@@ -157,7 +158,6 @@ export function syllableToSteps(syllable) {
       steps.push(String.fromCharCode(HANGUL_BASE + choIdx * 588 + jungIdx * 28 + JONG.indexOf(cur)));
     }
   }
-
   return steps;
 }
 
@@ -171,43 +171,50 @@ const NEIGHBORS = {
   o:"iklp", p:"ol", q:"wa", r:"edft", s:"awedxz", t:"rfgy", u:"yhji",
   v:"cfgb", w:"qase", x:"zsdc", y:"tghu", z:"asx",
 };
-
-function neighborTypo(ch) {
+function neighborTypo(rng, ch) {
   const pool = NEIGHBORS[ch.toLowerCase()];
   if (!pool) return null;
-  const pick = pool[Math.floor(Math.random() * pool.length)];
+  const pick = pool[Math.floor(rng.next() * pool.length)];
   return ch === ch.toUpperCase() ? pick.toUpperCase() : pick;
 }
 
 // ============================================================
-// 저수준: 단일 키 입력
+// 저수준 키 이벤트
 // ============================================================
 
-/** ASCII / 기호 한 글자 입력 (keyDown + keyUp). 비ASCII는 Input.insertText로 폴백. */
-export async function typeChar(send, ch) {
-  const info = charToKey(ch);
-  if (info.insertOnly) {
-    await send("Input.insertText", { text: ch });
-    return;
-  }
-
-  const modifiers = mods({ shift: info.shift });
-  const base = {
+function keyBase(info, modifiers) {
+  return {
     key: info.key, code: info.code,
     windowsVirtualKeyCode: info.kc, nativeVirtualKeyCode: info.kc,
     modifiers,
   };
-
-  await send("Input.dispatchKeyEvent", {
-    ...base, type: "keyDown",
-    text: info.text, unmodifiedText: info.text,
-  });
-  await sleep(rand(20, 80)); // 키가 눌려있는 시간
-  await send("Input.dispatchKeyEvent", { ...base, type: "keyUp" });
 }
 
-/** 특수 키 한 번 누름 (Enter / Backspace / Arrow* 등). modifierOpts에 { shift, ctrl, alt, meta } 전달 가능 */
+async function sendKeyDown(send, info) {
+  const modifiers = mods({ shift: info.shift });
+  await send("Input.dispatchKeyEvent", {
+    ...keyBase(info, modifiers), type: "keyDown",
+    text: info.text, unmodifiedText: info.text,
+  });
+}
+async function sendKeyUp(send, info) {
+  const modifiers = mods({ shift: info.shift });
+  await send("Input.dispatchKeyEvent", { ...keyBase(info, modifiers), type: "keyUp" });
+}
+
+/** ASCII/기호 한 글자 (down + hold + up). 비ASCII는 insertText. */
+export async function typeChar(send, ch) {
+  const p = getPersona();
+  const info = charToKey(ch);
+  if (info.insertOnly) { await send("Input.insertText", { text: ch }); return; }
+  await sendKeyDown(send, info);
+  await sleep(p.rng.logNormal(p.keyboard.holdMedian, 0.32, 22, 200));
+  await sendKeyUp(send, info);
+}
+
+/** 특수 키 한 번 누름 */
 export async function pressKey(send, name, modifierOpts = {}) {
+  const p = getPersona();
   const s = SPECIAL[name];
   if (!s) throw new Error(`unknown key: ${name}`);
   const modifiers = mods(modifierOpts);
@@ -220,24 +227,23 @@ export async function pressKey(send, name, modifierOpts = {}) {
     ...base, type: "keyDown",
     ...(s.text ? { text: s.text, unmodifiedText: s.text } : {}),
   });
-  await sleep(rand(25, 70));
+  await sleep(p.rng.logNormal(p.keyboard.holdMedian * 0.8, 0.3, 20, 160));
   await send("Input.dispatchKeyEvent", { ...base, type: "keyUp" });
 }
 
-/**
- * 한글 음절 한 글자를 두벌식 자모 단위로 IME 조합 후 확정.
- * 발생 이벤트: keydown(keyCode=229) × N → compositionstart → compositionupdate × N → compositionend + input
- */
+// ============================================================
+// 한글 음절 (IME 조합)
+// ============================================================
+
 export async function typeHangulSyllable(send, syllable, opts = {}) {
-  const baseDelay = opts.baseDelay ?? 60000 / 280;
-  const jitter    = opts.jitter    ?? 0.6;
+  const p = getPersona();
+  const gap = opts.gap ?? (() => p.typingRhythm());
 
   const code    = syllable.charCodeAt(0) - HANGUL_BASE;
   const choIdx  = Math.floor(code / 588);
   const jungIdx = Math.floor((code % 588) / 28);
   const jongIdx = code % 28;
 
-  // 실제로 누르는 자모 키 시퀀스 (복합 자모는 두 타로 쪼갬)
   const jamos = [CHO[choIdx]];
   jamos.push(...(JUNG_COMPOUND[JUNG[jungIdx]] ?? [JUNG[jungIdx]]));
   if (jongIdx > 0) {
@@ -252,94 +258,138 @@ export async function typeHangulSyllable(send, syllable, opts = {}) {
     if (!k) continue;
     const modifiers = mods({ shift: k.shift });
 
-    // 1) IME 표준 keyDown: code는 물리 두벌식 키, keyCode는 229("IME 처리 중")
     await send("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key: "Process",
-      code: k.code,
-      windowsVirtualKeyCode: 229,
-      nativeVirtualKeyCode: 229,
-      modifiers,
+      type: "keyDown", key: "Process", code: k.code,
+      windowsVirtualKeyCode: 229, nativeVirtualKeyCode: 229, modifiers,
     });
-
-    // 2) compositionstart / compositionupdate
     await send("Input.imeSetComposition", {
-      text: steps[i],
-      selectionStart: steps[i].length,
-      selectionEnd: steps[i].length,
+      text: steps[i], selectionStart: steps[i].length, selectionEnd: steps[i].length,
     });
-
-    await sleep(rand(20, 60));
-
-    // 3) keyUp — IME가 처리한 자모를 노출
+    await sleep(p.rng.logNormal(p.keyboard.holdMedian * 0.9, 0.32, 18, 150));
     await send("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key: jamo,
-      code: k.code,
-      windowsVirtualKeyCode: k.kc,
-      nativeVirtualKeyCode: k.kc,
-      modifiers,
+      type: "keyUp", key: jamo, code: k.code,
+      windowsVirtualKeyCode: k.kc, nativeVirtualKeyCode: k.kc, modifiers,
     });
 
-    if (i < jamos.length - 1) {
-      await sleep(baseDelay * rand(1 - jitter, 1 + jitter));
-    }
+    if (i < jamos.length - 1) await sleep(gap() * 1.05);
   }
-
-  // 4) compositionend + input — 음절 확정
   await send("Input.insertText", { text: syllable });
 }
 
 // ============================================================
-// 고수준: 사람처럼 문자열 입력
+// 고수준 타이핑
 // ============================================================
 
+function isFastAscii(ch) {
+  return /^[a-zA-Z]$/.test(ch);
+}
+
+/** 다음 글자까지 간격 계산 (리듬 + 문맥) */
+function gapAfter(p, ch) {
+  let delay = p.typingRhythm();
+  if (/[.!?]/.test(ch))      delay *= p.keyboard.punctPause;
+  else if (/[,;:)]/.test(ch)) delay *= (1 + (p.keyboard.punctPause - 1) * 0.5);
+  if (/[0-9]/.test(ch))      delay *= 1.25;           // 숫자열은 느림
+  if (SHIFTED[ch] || SYM[ch]) delay *= 1.15;          // 기호도 느림
+  if (ch === " ")            delay *= 1.05;
+  if (p.rng.bool(p.keyboard.pauseChance)) delay += p.rng.logNormal(600, 0.4, 280, 1400);
+  return delay;
+}
+
 /**
- * 사람처럼 자연스러운 간격으로 텍스트를 타이핑한다.
- *
- * @param {Function} send  CDP send 함수 — (method, params) => Promise
- * @param {string}   text
- * @param {object}   [opts]
- * @param {number}   [opts.wpm=280]          분당 글자 수 (사람 평균 250~400)
- * @param {number}   [opts.jitter=0.55]      글자 간격 변동폭 (0=등속, 1=강함)
- * @param {number}   [opts.pauseChance=0.04] "잠깐 멈춤" 발생 확률
- * @param {number}   [opts.typoChance=0]     영문 오타 후 백스페이스 정정 확률
+ * 사람처럼 텍스트를 타이핑한다.
+ * @param {Function} send
+ * @param {string} text
+ * @param {object} [opts]
+ * @param {number} [opts.typoChance]   override (기본: 페르소나 typoRate)
+ * @param {boolean} [opts.rollover]    롤오버 on/off (기본: 페르소나)
  */
 export async function humanType(send, text, opts = {}) {
-  const wpm         = opts.wpm         ?? 280;
-  const jitter      = opts.jitter      ?? 0.55;
-  const pauseChance = opts.pauseChance ?? 0.04;
-  const typoChance  = opts.typoChance  ?? 0;
-  const baseDelay   = 60000 / wpm;
+  const p = getPersona();
+  const typoChance = opts.typoChance ?? p.keyboard.typoRate;
+  const allowRollover = opts.rollover ?? true;
+
+  // 보류된 keyUp (롤오버: 다음 키 down 직후에 떼기 위해)
+  let pendingUp = null;
+  const flushPending = async () => {
+    if (pendingUp) { await sendKeyUp(send, pendingUp); pendingUp = null; }
+  };
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
+    const next = text[i + 1];
 
+    // ── 한글 ──
     if (isHangulSyllable(ch)) {
-      await typeHangulSyllable(send, ch, { baseDelay, jitter });
-    } else if (ch === "\n") {
-      await pressKey(send, "Enter");
-    } else if (ch === "\t") {
-      await pressKey(send, "Tab");
-    } else {
-      // 영문 오타 → 인지 지연 → 백스페이스 → 정정
-      if (typoChance > 0 && /[a-zA-Z]/.test(ch) && Math.random() < typoChance) {
-        const typo = neighborTypo(ch);
-        if (typo) {
-          await typeChar(send, typo);
-          await sleep(rand(180, 480));
-          await pressKey(send, "Backspace");
-          await sleep(rand(70, 180));
-        }
-      }
+      await flushPending();
+      await typeHangulSyllable(send, ch);
+      await sleep(gapAfter(p, ch));
+      continue;
+    }
+    // ── 줄바꿈 / 탭 ──
+    if (ch === "\n") { await flushPending(); await pressKey(send, "Enter"); await sleep(gapAfter(p, ch) + p.rng.logNormal(160, 0.4, 80, 500)); continue; }
+    if (ch === "\t") { await flushPending(); await pressKey(send, "Tab");   await sleep(gapAfter(p, ch)); continue; }
+
+    // ── transposition 오타: 인접 두 글자 순서 바꿔 치고 정정 ──
+    if (typoChance > 0 && isFastAscii(ch) && isFastAscii(next) && ch !== next &&
+        p.rng.bool(typoChance * 0.4)) {
+      await flushPending();
+      await typeChar(send, next);                       // 순서 바꿔서
+      await sleep(p.typingRhythm() * 0.7);
       await typeChar(send, ch);
+      await sleep(p.rng.logNormal(320, 0.4, 160, 700)); // 알아챔
+      await pressKey(send, "Backspace");
+      await sleep(p.rng.logNormal(90, 0.4, 40, 220));
+      await pressKey(send, "Backspace");
+      await sleep(p.rng.logNormal(140, 0.4, 60, 320));
+      await typeChar(send, ch);                          // 올바르게 다시
+      await sleep(p.typingRhythm() * 0.7);
+      await typeChar(send, next);
+      await sleep(gapAfter(p, next));
+      i++; // next까지 소비
+      continue;
     }
 
-    let delay = baseDelay * rand(1 - jitter, 1 + jitter);
-    if (/[ ,.!?;:)]/.test(ch))       delay += rand(40, 160);
-    if (ch === "\n")                  delay += rand(120, 400);
-    if (Math.random() < pauseChance)  delay += rand(300, 1100);
+    // ── 인접 키 오타 후 정정 ──
+    if (typoChance > 0 && isFastAscii(ch) && p.rng.bool(typoChance)) {
+      const typo = neighborTypo(p.rng, ch);
+      if (typo) {
+        await flushPending();
+        await typeChar(send, typo);
+        await sleep(p.rng.logNormal(360, 0.4, 170, 760));
+        await pressKey(send, "Backspace");
+        await sleep(p.rng.logNormal(110, 0.4, 50, 260));
+      }
+    }
 
-    await sleep(Math.max(8, delay));
+    // ── 일반 ASCII: 롤오버 고려 ──
+    const info = charToKey(ch);
+    if (info.insertOnly) {
+      await flushPending();
+      await send("Input.insertText", { text: ch });
+      await sleep(gapAfter(p, ch));
+      continue;
+    }
+
+    const rollover =
+      allowRollover && isFastAscii(ch) && isFastAscii(next) &&
+      HAND[ch.toLowerCase()] !== HAND[(next || "").toLowerCase()] && // 다른 손일 때 더 자연스러운 롤오버
+      p.rng.bool(p.keyboard.rolloverProb);
+
+    await sendKeyDown(send, info);
+    // 이전 보류 키를 지금(현재 down 직후) 떼면 down1→down2→up1 패턴
+    await flushPending();
+
+    if (rollover) {
+      // 현재 키 up을 보류 → 다음 글자 down 이후에 떼짐(겹침)
+      await sleep(p.rng.logNormal(p.keyboard.holdMedian * 0.5, 0.3, 14, 110));
+      pendingUp = info;
+      await sleep(gapAfter(p, ch) * 0.55); // 롤오버는 간격 짧음
+    } else {
+      await sleep(p.rng.logNormal(p.keyboard.holdMedian, 0.32, 22, 200));
+      await sendKeyUp(send, info);
+      await sleep(gapAfter(p, ch));
+    }
   }
+  await flushPending();
 }
