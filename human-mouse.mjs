@@ -1,27 +1,24 @@
-// human-mouse.mjs
-// CDP(Input.* 도메인)로 사람처럼 마우스 동작을 시뮬레이션한다.
-//   - 이동(MoveTo) / 클릭(Click) / 호버(Hover) / 휠 스크롤(Wheel) / 드래그(Drag)
-//   - 베지어 곡선 + smoothstep 진행도 + 양 끝 taper 노이즈 + 가변 속도
-//   - 좌표계: CSS 픽셀 (Input.dispatchMouseEvent / getBoundingClientRect 공용)
-//   - selector를 넘기면 Runtime.evaluate로 요소 중앙 좌표를 자동 계산
-//   - 마지막 커서 위치를 모듈 차원에서 추적, 다음 호출의 시작점으로 사용
-//   - 백그라운드 idle 떨림 토글: startIdleJitter / stopIdleJitter
-//     → 다른 동작 중에는 자동으로 양보 (busyCount 기반)
+// human-mouse.mjs (v2)
+// CDP로 사람처럼 마우스를 움직이고 클릭/호버/스크롤/드래그한다.
 //
-// 사용:
-//   import {
-//     humanMoveTo, humanClick, humanHover, humanWheel, humanDrag,
-//     startIdleJitter, stopIdleJitter,
-//   } from "./human-mouse.mjs";
-//   const send = (m, p) => cdpSession.send(m, p);
+// v2 개선점:
+//   - 페르소나 연동: 세션 = 한 사람. 속도/곡선/정밀도 성향이 일관됨
+//   - submovement: 목표를 살짝 지나쳤다(overshoot) 1~2회 보정해 도달 (Fitts' law)
+//   - 정수 좌표 + 중복 스킵: 실제 하드웨어 마우스처럼 정수 픽셀, 안 움직이면 이벤트 없음
+//   - 불규칙 이벤트 간격: 고정 fps가 아니라 폴링레이트+OS지연 흉내(로그정규 dt)
+//   - 클릭 위치 가우시안 분산: 항상 정중앙이 아니라 요소 안에서 흩어짐
+//   - press 드리프트: 누르는 동안 1~2px 미세 이동 후 release
+//
+// 좌표계는 CSS 픽셀. send = (method, params) => Promise.
+
+import { createPersona } from "./persona.mjs";
+import { clamp } from "./human-random.mjs";
 
 // ============================================================
 // 유틸
 // ============================================================
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const rand  = (lo, hi) => lo + Math.random() * (hi - lo);
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function cubic(p0, p1, p2, p3, t) {
   const u = 1 - t;
@@ -33,140 +30,215 @@ function smoothstep(t) { return t * t * (3 - 2 * t); }
 // 모듈 상태
 // ============================================================
 
-let cursorPos  = { x: 100, y: 100 };
-let busyCount  = 0;
-let idleConfig = null;
-let idleTimer  = null;
+let cursorPos      = { x: 100, y: 100 };
+let activePersona  = null;
+let busyCount      = 0;
+let idleConfig     = null;
+let idleTimer      = null;
+let lastEmitted    = { x: null, y: null };
 
+export function setPersona(persona) { activePersona = persona; }
+export function getPersona() {
+  if (!activePersona) activePersona = createPersona();
+  return activePersona;
+}
 export function getCursorPos() { return { ...cursorPos }; }
 export function setCursorPos(p) { cursorPos = { x: p.x, y: p.y }; }
 
-// busyCount 기반 reentrant lock — idle jitter가 다른 동작과 충돌하지 않게
 async function withBusy(fn) {
   busyCount++;
   try { return await fn(); }
   finally { busyCount--; }
 }
 
+// 정수 좌표로 이벤트 발송. 직전과 같은 정수면 스킵(실제 마우스는 안 움직이면 이벤트 없음).
+async function emitMove(send, x, y, button = "none") {
+  const ix = Math.round(x);
+  const iy = Math.round(y);
+  if (ix === lastEmitted.x && iy === lastEmitted.y) return false;
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: ix, y: iy,
+    button,
+    pointerType: "mouse",
+  });
+  lastEmitted = { x: ix, y: iy };
+  cursorPos = { x: ix, y: iy };
+  return true;
+}
+
 // ============================================================
-// selector → 좌표
+// selector → 좌표 / bbox
 // ============================================================
 
-export async function getElementCenter(send, selector) {
+export async function getElementBox(send, selector) {
   const { result } = await send("Runtime.evaluate", {
     expression: `(() => {
       const el = document.querySelector(${JSON.stringify(selector)});
       if (!el) throw new Error("element not found: " + ${JSON.stringify(selector)});
       const r = el.getBoundingClientRect();
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      return { x: r.left, y: r.top, width: r.width, height: r.height,
+               cx: r.left + r.width/2, cy: r.top + r.height/2 };
     })()`,
     returnByValue: true,
   });
   return result.value;
 }
 
-async function resolveTarget(send, target) {
+export async function getElementCenter(send, selector) {
+  const b = await getElementBox(send, selector);
+  return { x: b.cx, y: b.cy };
+}
+
+// target: selector(string) | {x,y} | bbox객체 → 중앙 좌표
+async function resolveCenter(send, target) {
   if (typeof target === "string") return await getElementCenter(send, target);
-  return target;
+  if (target && typeof target.cx === "number") return { x: target.cx, y: target.cy };
+  return { x: target.x, y: target.y };
+}
+
+// 클릭용: 요소 안에서 가우시안으로 흩어진 한 점 (정중앙 회피)
+async function resolveClickPoint(send, target) {
+  const p = getPersona();
+  let box = null;
+  if (typeof target === "string") box = await getElementBox(send, target);
+  else if (target && typeof target.width === "number") box = target;
+
+  if (!box) return await resolveCenter(send, target); // 좌표 직접 지정이면 그대로
+
+  // 중앙 기준, 요소 크기의 clickPrecision 비율을 표준편차로. 가장자리 넘지 않게 절단.
+  const sdX = (box.width  / 2) * p.mouse.clickPrecision;
+  const sdY = (box.height / 2) * p.mouse.clickPrecision;
+  const off = p.rng.gaussian2D(sdX, sdY);
+  return {
+    x: clamp(box.cx + off.x, box.x + 2, box.x + box.width  - 2),
+    y: clamp(box.cy + off.y, box.y + 2, box.y + box.height - 2),
+  };
 }
 
 // ============================================================
-// 저수준: 자연스러운 이동
+// 단일 곡선(leg) 이동
+// ============================================================
+
+// start → end 를 베지어 + taper 노이즈로 이동. 시간 기반 + 불규칙 dt.
+async function moveLeg(send, start, end, duration, button, opts = {}) {
+  const p = getPersona();
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.5) { await emitMove(send, end.x, end.y, button); return; }
+
+  const curvy = p.mouse.curviness * (opts.curveScale ?? 1);
+  const sign  = p.rng.bool() ? -1 : 1;
+  const swing = (40 + p.rng.range(0, 120) * curvy) * sign;
+  const perpBias = p.rng.range(40, 130) * curvy;
+
+  const cp1 = {
+    x: start.x + dx * 0.33 + swing,
+    y: start.y + dy * 0.33 - perpBias,
+  };
+  const cp2 = {
+    x: start.x + dx * 0.72 - swing * 0.8,
+    y: start.y + dy * 0.72 + perpBias * 0.7,
+  };
+
+  const phase1 = p.rng.range(0, Math.PI * 2);
+  const jitterAmp = p.mouse.jitter * (opts.jitterScale ?? 1);
+
+  function point(t) {
+    // 양 끝 감속(smoothstep) + 미세 속도 출렁임
+    const wobble = 0.05 * Math.sin(2 * Math.PI * t * 2.3 + phase1);
+    const e = clamp(smoothstep(t) + wobble, 0, 1);
+    const taper = Math.sin(Math.PI * e); // 양 끝 0, 중간 1
+    const nx = 3.5 * Math.sin(5.2 * Math.PI * e + phase1) + 1.8 * Math.sin(13.1 * Math.PI * e);
+    const ny = 3.0 * Math.cos(4.7 * Math.PI * e + phase1) + 1.8 * Math.sin(11.3 * Math.PI * e);
+    return {
+      x: cubic(start.x, cp1.x, cp2.x, end.x, e) + taper * nx * jitterAmp,
+      y: cubic(start.y, cp1.y, cp2.y, end.y, e) + taper * ny * jitterAmp,
+    };
+  }
+
+  let elapsed = 0;
+  while (elapsed < duration) {
+    // 폴링레이트+OS지연 흉내: 고정 간격이 아닌 로그정규 dt
+    const dt = p.rng.logNormal(p.mouse.pollMs, 0.3, 2, 38);
+    elapsed += dt;
+    const t = clamp(elapsed / duration, 0, 1);
+    const pt = point(t);
+    await emitMove(send, pt.x, pt.y, button);
+    await sleep(dt);
+    if (t >= 1) break;
+  }
+  await emitMove(send, end.x, end.y, button);
+}
+
+// ============================================================
+// 이동 (오버슈트 + 보정 포함)
 // ============================================================
 
 /**
- * 사람처럼 자연스럽게 마우스 커서를 이동시킨다.
- *
+ * 사람처럼 이동. 목표를 살짝 지나쳤다 보정하는 submovement 포함.
  * @param {Function} send
- * @param {string|{x:number,y:number}} target
+ * @param {string|{x,y}|bbox} target
  * @param {object} [options]
- * @param {{x:number,y:number}} [options.start]                       시작 좌표 (기본: 마지막 위치)
- * @param {number} [options.duration]                                  총 이동 시간(ms)
- * @param {number} [options.fps=60]
- * @param {number} [options.jitter=1]                                  떨림 강도 (0=직선)
- * @param {"none"|"left"|"right"|"middle"} [options.button="none"]     드래그 시 "left"
- * @returns {Promise<{x:number,y:number}>}
+ * @param {{x,y}} [options.start]
+ * @param {number} [options.duration]
+ * @param {number} [options.jitter]            떨림 배율 override
+ * @param {"none"|"left"|"right"|"middle"} [options.button="none"]
+ * @param {boolean} [options.overshoot]        강제 on/off (기본: 페르소나 확률)
  */
 export async function humanMoveTo(send, target, options = {}) {
   return withBusy(async () => {
-    const dst    = await resolveTarget(send, target);
-    const start  = options.start  ?? cursorPos;
+    const p = getPersona();
+    const dst = await resolveCenter(send, target);
+    const start = options.start ?? cursorPos;
     const button = options.button ?? "none";
 
-    const dx   = dst.x - start.x;
-    const dy   = dst.y - start.y;
+    const dx = dst.x - start.x;
+    const dy = dst.y - start.y;
     const dist = Math.hypot(dx, dy);
+    const totalMs = options.duration ?? p.moveDuration(dist);
 
-    const totalMs = options.duration
-      ?? clamp(dist * 2.2 + (Math.random() * 400 - 200), 350, 1800);
+    const jitterScale = options.jitter !== undefined ? options.jitter / p.mouse.jitter : 1;
 
-    const fps     = options.fps    ?? 60;
-    const frameMs = 1000 / fps;
-    const jitter  = options.jitter ?? 1;
+    // 오버슈트: 거리가 충분하고 페르소나 확률에 걸릴 때
+    const doOvershoot =
+      options.overshoot ?? (dist > 140 && p.rng.bool(p.mouse.overshootProb));
 
-    const sign  = Math.random() < 0.5 ? -1 : 1;
-    const swing = (60 + Math.random() * 140) * sign;
-
-    const cp1 = {
-      x: start.x + dx * 0.33 + swing,
-      y: start.y + dy * 0.33 - (60 + Math.random() * 120),
-    };
-    const cp2 = {
-      x: start.x + dx * 0.72 - swing * 0.8,
-      y: start.y + dy * 0.72 + (40 + Math.random() * 120),
-    };
-
-    const phase1 = Math.random() * Math.PI * 2;
-    const phase2 = Math.random() * Math.PI * 2;
-
-    function point(t) {
-      const e = smoothstep(t);
-      const taper = Math.sin(Math.PI * e);
-      const nx = 4   * Math.sin(5.2 * Math.PI * e + phase1) + 2 * Math.sin(13.1 * Math.PI * e);
-      const ny = 3.5 * Math.cos(4.7 * Math.PI * e + phase2) + 2 * Math.sin(11.3 * Math.PI * e);
-      return {
-        x: cubic(start.x, cp1.x, cp2.x, dst.x, e) + taper * nx * jitter,
-        y: cubic(start.y, cp1.y, cp2.y, dst.y, e) + taper * ny * jitter,
-      };
+    if (!doOvershoot) {
+      await moveLeg(send, start, dst, totalMs, button, { jitterScale });
+      return { ...cursorPos };
     }
 
-    let virtual  = 0;
-    let lastTime = Date.now();
+    // 목표 너머의 오버슈트 지점 (진행 방향 + 약간의 수직 흔들림)
+    const ux = dx / (dist || 1);
+    const uy = dy / (dist || 1);
+    const over = dist * p.mouse.overshootScale * p.rng.range(0.6, 1.4);
+    const perp = p.rng.range(-1, 1) * over * 0.5;
+    const overshootPt = {
+      x: dst.x + ux * over - uy * perp,
+      y: dst.y + uy * over + ux * perp,
+    };
 
-    while (virtual < 1) {
-      const now = Date.now();
-      const dt  = Math.min(40, now - lastTime);
-      lastTime  = now;
-
-      const speedMul =
-        0.82 +
-        0.22 * Math.sin(2 * Math.PI * virtual * 2.1 + phase1) +
-        0.12 * Math.sin(2 * Math.PI * virtual * 5.3 + phase2);
-
-      virtual += (dt / totalMs) * clamp(speedMul, 0.42, 1.35);
-
-      const t = Math.min(1, virtual);
-      const p = point(t);
-
-      await send("Input.dispatchMouseEvent", {
-        type: "mouseMoved",
-        x: p.x, y: p.y,
-        button,
-        pointerType: "mouse",
-      });
-
-      cursorPos = p;
-      await sleep(frameMs);
-    }
-
-    await send("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: dst.x, y: dst.y,
-      button,
-      pointerType: "mouse",
+    // 주 동작(빠르게, 오버슈트 지점까지) + 보정(느리게, 정확히 목표로)
+    await moveLeg(send, start, overshootPt, totalMs * 0.78, button, {
+      jitterScale, curveScale: 1,
     });
-    cursorPos = dst;
-    return dst;
+    await sleep(p.rng.logNormal(45, 0.4, 12, 160)); // 방향 전환 직전 짧은 멈칫
+    await moveLeg(send, overshootPt, dst, totalMs * 0.34, button, {
+      jitterScale: jitterScale * 0.5, curveScale: 0.4,
+    });
+
+    // 가끔 한 번 더 미세 보정
+    if (p.rng.bool(0.25)) {
+      const tiny = { x: dst.x + p.rng.range(-2, 2), y: dst.y + p.rng.range(-2, 2) };
+      await moveLeg(send, cursorPos, tiny, totalMs * 0.12, button, {
+        jitterScale: 0.2, curveScale: 0.2,
+      });
+      await emitMove(send, dst.x, dst.y, button);
+    }
+
+    return { ...cursorPos };
   });
 }
 
@@ -175,84 +247,67 @@ export async function humanMoveTo(send, target, options = {}) {
 // ============================================================
 
 /**
- * 자연스럽게 이동한 뒤 클릭한다.
- *
- * @param {Function} send
- * @param {string|{x:number,y:number}} target
- * @param {object} [options]  humanMoveTo 옵션 포함
+ * 이동 후 클릭. 클릭 지점은 요소 안에서 가우시안 분산, press 중 미세 드리프트.
+ * @param {object} [options]  humanMoveTo 옵션 +
  * @param {"left"|"right"|"middle"} [options.button="left"]
- * @param {number} [options.clickCount=1]  더블클릭은 2
+ * @param {number} [options.clickCount=1]
  */
 export async function humanClick(send, target, options = {}) {
   return withBusy(async () => {
-    const dst        = await humanMoveTo(send, target, options);
-    const button     = options.button     ?? "left";
+    const p = getPersona();
+    const point = await resolveClickPoint(send, target);
+    await humanMoveTo(send, point, options);
+
+    const button = options.button ?? "left";
     const clickCount = options.clickCount ?? 1;
 
-    await sleep(rand(60, 140));
+    await sleep(p.rng.logNormal(90, 0.4, 30, 320)); // 조준 후 정지
 
+    const press = { ...cursorPos };
     await send("Input.dispatchMouseEvent", {
       type: "mousePressed",
-      x: dst.x, y: dst.y,
+      x: press.x, y: press.y,
       button, clickCount,
       pointerType: "mouse",
     });
 
-    await sleep(rand(40, 80));
+    // 누르는 동안 손가락 드리프트
+    await sleep(p.rng.logNormal(55, 0.45, 18, 200));
+    const drift = p.rng.gaussian2D(p.mouse.pressDrift, p.mouse.pressDrift);
+    const rel = { x: Math.round(press.x + drift.x), y: Math.round(press.y + drift.y) };
+    if (rel.x !== press.x || rel.y !== press.y) {
+      await emitMove(send, rel.x, rel.y, button);
+    }
 
     await send("Input.dispatchMouseEvent", {
       type: "mouseReleased",
-      x: dst.x, y: dst.y,
+      x: rel.x, y: rel.y,
       button, clickCount,
       pointerType: "mouse",
     });
 
-    return dst;
+    return rel;
   });
 }
 
 // ============================================================
-// 호버 (요소 위에서 머무름)
+// 호버
 // ============================================================
 
-/**
- * 요소 위로 이동한 뒤 일정 시간 머문다. 머무는 동안 미세하게 떨림.
- *
- * @param {Function} send
- * @param {string|{x:number,y:number}} target
- * @param {object} [options]
- * @param {number} [options.dwellMs]        머무는 시간(ms). 기본 500~1500 랜덤
- * @param {number} [options.hoverJitter=2]  떨림 반경(px)
- * @param {number} [options.tickMs=80]      떨림 간격
- */
 export async function humanHover(send, target, options = {}) {
   return withBusy(async () => {
-    const dst         = await humanMoveTo(send, target, options);
-    const dwellMs     = options.dwellMs     ?? rand(500, 1500);
-    const hoverJitter = options.hoverJitter ?? 2;
-    const tickMs      = options.tickMs      ?? 80;
+    const p = getPersona();
+    const dst = await humanMoveTo(send, target, options);
+    const dwellMs = options.dwellMs ?? p.readPause(1.2);
+    const radius  = options.hoverJitter ?? p.behavior.idleRadius;
 
     const end = Date.now() + dwellMs;
     while (Date.now() < end) {
-      const dx = (Math.random() - 0.5) * hoverJitter * 2;
-      const dy = (Math.random() - 0.5) * hoverJitter * 2;
-      await send("Input.dispatchMouseEvent", {
-        type: "mouseMoved",
-        x: dst.x + dx, y: dst.y + dy,
-        button: "none",
-        pointerType: "mouse",
-      });
-      await sleep(tickMs * rand(0.7, 1.3));
+      const off = p.rng.gaussian2D(radius, radius);
+      await emitMove(send, dst.x + off.x, dst.y + off.y);
+      await sleep(p.rng.logNormal(90, 0.4, 30, 260));
     }
-
-    // 정확한 위치로 복귀
-    await send("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: dst.x, y: dst.y,
-      button: "none",
-      pointerType: "mouse",
-    });
-    cursorPos = dst;
+    await emitMove(send, dst.x, dst.y);
     return dst;
   });
 }
@@ -262,53 +317,37 @@ export async function humanHover(send, target, options = {}) {
 // ============================================================
 
 /**
- * 사람처럼 자연스럽게 스크롤한다. 한 번의 큰 휠 이벤트가 아니라
- * 여러 tick으로 가속·감속하며 보내고, 가끔 중간 정지를 섞는다.
- *
- * @param {Function} send
- * @param {number} deltaY                              누적 스크롤 양(px). 양수=아래
- * @param {object} [options]
- * @param {number} [options.deltaX=0]
- * @param {string|{x:number,y:number}} [options.target]  스크롤 발생 좌표 (기본: 현재 커서)
- * @param {number} [options.ticks]                       나눠 보낼 횟수 (기본: 양에 따라 4~24)
- * @param {number} [options.duration]                    총 시간(ms)
- * @param {number} [options.pauseChance=0.12]            중간 정지 확률
+ * 사람처럼 스크롤. 여러 tick으로 가속·감속, 가끔 멈춤. 간격은 로그정규.
  */
 export async function humanWheel(send, deltaY, options = {}) {
   return withBusy(async () => {
+    const p = getPersona();
     const deltaX = options.deltaX ?? 0;
-    const pos = options.target
-      ? await resolveTarget(send, options.target)
-      : cursorPos;
+    const pos = options.target ? await resolveCenter(send, options.target) : cursorPos;
 
-    const totalAbs    = Math.max(1, Math.hypot(deltaX, deltaY));
-    const ticks       = options.ticks       ?? clamp(Math.ceil(totalAbs / 70), 4, 24);
-    const totalMs     = options.duration    ?? clamp(totalAbs * 1.4 + 280, 380, 2400);
+    const totalAbs = Math.max(1, Math.hypot(deltaX, deltaY));
+    const ticks = options.ticks ?? clamp(Math.ceil(totalAbs / p.rng.range(55, 90)), 4, 26);
+    const totalMs = options.duration ?? p.rng.logNormal(totalAbs * 1.4 + 280, 0.25, 380, 2600);
     const pauseChance = options.pauseChance ?? 0.12;
 
-    let sentX = 0;
-    let sentY = 0;
-    const frameMsBase = totalMs / ticks;
+    let sentX = 0, sentY = 0;
+    const frameBase = totalMs / ticks;
 
     for (let i = 1; i <= ticks; i++) {
-      // smoothstep 누적 → 가속·감속
       const e = smoothstep(i / ticks);
-      const targetX = deltaX * e;
-      const targetY = deltaY * e;
-      const dx = targetX - sentX;
-      const dy = targetY - sentY;
-      sentX = targetX;
-      sentY = targetY;
+      const tx = deltaX * e, ty = deltaY * e;
+      const dx = tx - sentX, dy = ty - sentY;
+      sentX = tx; sentY = ty;
 
       await send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
-        x: pos.x, y: pos.y,
-        deltaX: dx, deltaY: dy,
+        x: Math.round(pos.x), y: Math.round(pos.y),
+        deltaX: Math.round(dx), deltaY: Math.round(dy),
         pointerType: "mouse",
       });
 
-      let wait = frameMsBase * rand(0.6, 1.4);
-      if (i < ticks && Math.random() < pauseChance) wait += rand(180, 600);
+      let wait = p.rng.logNormal(frameBase, 0.3, frameBase * 0.4, frameBase * 2.2);
+      if (i < ticks && p.rng.bool(pauseChance)) wait += p.rng.logNormal(320, 0.4, 140, 900);
       await sleep(wait);
     }
   });
@@ -318,104 +357,79 @@ export async function humanWheel(send, deltaY, options = {}) {
 // 드래그
 // ============================================================
 
-/**
- * 한 지점에서 다른 지점으로 사람처럼 자연스럽게 드래그한다.
- *
- * @param {Function} send
- * @param {string|{x:number,y:number}} fromTarget
- * @param {string|{x:number,y:number}} toTarget
- * @param {object} [options]  humanMoveTo 옵션 포함
- * @param {"left"|"right"|"middle"} [options.button="left"]
- */
 export async function humanDrag(send, fromTarget, toTarget, options = {}) {
   return withBusy(async () => {
+    const p = getPersona();
     const button = options.button ?? "left";
-    const from   = await resolveTarget(send, fromTarget);
+    const from = await resolveCenter(send, fromTarget);
 
-    // 1) 시작점으로 자연스럽게 이동
     await humanMoveTo(send, from, options);
-    await sleep(rand(100, 220));
+    await sleep(p.rng.logNormal(150, 0.4, 60, 400));
 
-    // 2) 누르기
     await send("Input.dispatchMouseEvent", {
       type: "mousePressed",
-      x: from.x, y: from.y,
-      button, clickCount: 1,
-      pointerType: "mouse",
+      x: Math.round(from.x), y: Math.round(from.y),
+      button, clickCount: 1, pointerType: "mouse",
     });
-    await sleep(rand(60, 160));
+    await sleep(p.rng.logNormal(110, 0.45, 40, 360));
 
-    // 3) 누른 상태로 곡선 이동 (button 옵션 전달)
-    const dst = await humanMoveTo(send, toTarget, { ...options, button, start: from });
-    await sleep(rand(80, 180));
+    // 누른 채로 곡선 이동 (드래그는 오버슈트 억제)
+    const dst = await humanMoveTo(send, toTarget, {
+      ...options, button, start: from, overshoot: false,
+    });
+    await sleep(p.rng.logNormal(120, 0.45, 50, 380));
 
-    // 4) 떼기
     await send("Input.dispatchMouseEvent", {
       type: "mouseReleased",
-      x: dst.x, y: dst.y,
-      button, clickCount: 1,
-      pointerType: "mouse",
+      x: Math.round(dst.x), y: Math.round(dst.y),
+      button, clickCount: 1, pointerType: "mouse",
     });
-
     return dst;
   });
 }
 
 // ============================================================
-// idle 떨림 (백그라운드, 다른 동작과 자동 양보)
+// idle 떨림
 // ============================================================
 
 function scheduleIdleTick() {
   if (!idleConfig) return;
-  const { intervalMin, intervalMax } = idleConfig;
-  idleTimer = setTimeout(idleTick, rand(intervalMin, intervalMax));
+  const { rng, intervalMin, intervalMax } = idleConfig;
+  idleTimer = setTimeout(idleTick, rng.range(intervalMin, intervalMax));
 }
 
 async function idleTick() {
   if (!idleConfig) return;
-  // 다른 동작 중이면 이벤트는 안 보내고 다음 tick만 다시 스케줄
   if (busyCount === 0) {
-    const { send, radius } = idleConfig;
-    const dx = (Math.random() - 0.5) * radius * 2;
-    const dy = (Math.random() - 0.5) * radius * 2;
+    const { send, rng, radius } = idleConfig;
+    const off = rng.gaussian2D(radius, radius);
     try {
       await send("Input.dispatchMouseEvent", {
         type: "mouseMoved",
-        x: cursorPos.x + dx,
-        y: cursorPos.y + dy,
+        x: Math.round(cursorPos.x + off.x),
+        y: Math.round(cursorPos.y + off.y),
         button: "none",
         pointerType: "mouse",
       });
     } catch {}
-    // cursorPos는 변경하지 않음 — 떨림은 의도된 좌표를 흔들리게 만들지 않게
   }
   scheduleIdleTick();
 }
 
-/**
- * 백그라운드에서 미세 떨림을 주기적으로 발생시킨다. 다른 동작 중에는 자동 양보.
- *
- * @param {Function} send
- * @param {object} [options]
- * @param {number} [options.radius=2.5]        떨림 반경(px)
- * @param {number} [options.intervalMin=500]   tick 간격 최소(ms)
- * @param {number} [options.intervalMax=2000]  tick 간격 최대(ms)
- */
 export function startIdleJitter(send, options = {}) {
   if (idleConfig) return;
+  const p = getPersona();
   idleConfig = {
     send,
-    radius:      options.radius      ?? 2.5,
-    intervalMin: options.intervalMin ?? 500,
-    intervalMax: options.intervalMax ?? 2000,
+    rng: p.rng,
+    radius:      options.radius      ?? p.behavior.idleRadius,
+    intervalMin: options.intervalMin ?? 600,
+    intervalMax: options.intervalMax ?? 2400,
   };
   scheduleIdleTick();
 }
 
 export function stopIdleJitter() {
-  if (idleTimer) {
-    clearTimeout(idleTimer);
-    idleTimer = null;
-  }
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   idleConfig = null;
 }
