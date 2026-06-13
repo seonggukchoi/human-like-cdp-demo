@@ -2,88 +2,44 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8" />
-<title>CDP Human Input Demo</title>
+<title>CDP Human Input Demo v2</title>
 <style>
-  html, body {
-    margin: 0;
-    height: 100%;
-    font-family: -apple-system, "Apple SD Gothic Neo", sans-serif;
-    background: #0f172a;
-    color: #e2e8f0;
-    overflow: hidden;
-  }
-  .container {
-    padding: 24px;
-    display: grid;
-    gap: 14px;
-    max-width: 720px;
-    margin: 0 auto;
-    position: relative;
-    z-index: 2;
-  }
-  h1 { margin: 0; font-size: 20px; color: #93c5fd; }
-  .panel {
-    background: rgba(30, 41, 59, 0.85);
-    border: 1px solid #334155;
-    border-radius: 12px;
-    padding: 14px 16px;
-    backdrop-filter: blur(4px);
-  }
-  label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; letter-spacing: 0.02em; }
-  input, textarea {
-    width: 100%;
-    background: #0f172a;
-    border: 1px solid #334155;
-    color: #f1f5f9;
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 16px;
-    box-sizing: border-box;
-    font-family: inherit;
-  }
-  textarea { min-height: 70px; resize: vertical; }
+  html, body { margin: 0; font-family: -apple-system, "Apple SD Gothic Neo", sans-serif; background: #0f172a; color: #e2e8f0; }
+  .container { padding: 20px; max-width: 820px; margin: 0 auto; display: grid; gap: 12px; }
+  h1 { margin: 0; font-size: 19px; color: #93c5fd; }
+  h2 { margin: 0 0 8px; font-size: 13px; color: #cbd5e1; }
+  .panel { background: rgba(30, 41, 59, 0.85); border: 1px solid #334155; border-radius: 12px; padding: 13px 15px; }
+  label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+  input, textarea { width: 100%; background: #0f172a; border: 1px solid #334155; color: #f1f5f9; border-radius: 8px; padding: 10px 12px; font-size: 15px; box-sizing: border-box; font-family: inherit; }
+  textarea { min-height: 54px; resize: vertical; }
   input:focus, textarea:focus { outline: 0; border-color: #60a5fa; }
-  button {
-    background: #38bdf8;
-    color: #082f49;
-    border: 0;
-    border-radius: 8px;
-    padding: 12px 20px;
-    font-size: 15px;
-    font-weight: 700;
-    cursor: pointer;
-  }
-  button.hit { background: #4ade80; transform: scale(1.03); }
-  #dot {
-    position: fixed;
-    width: 14px; height: 14px;
-    border-radius: 50%;
-    background: #ef4444;
-    box-shadow: 0 0 18px #ef4444;
-    transform: translate(-50%, -50%);
-    pointer-events: none;
-    z-index: 999;
-    left: -100px; top: -100px;
-  }
-  canvas {
-    position: fixed; inset: 0;
-    width: 100%; height: 100%;
-    z-index: 1;
-    pointer-events: none;
-  }
-  #log {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    color: #cbd5e1;
-    background: #020617;
-    padding: 10px;
-    border-radius: 8px;
-    height: 110px;
-    overflow: auto;
-    line-height: 1.5;
-  }
-  #log div.k { color: #fcd34d; }
-  #log div.c { color: #86efac; }
+
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .stat { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .stat b { color: #fcd34d; }
+  .ok { color: #4ade80; } .bad { color: #f87171; }
+
+  .hover-area { display: inline-block; padding: 10px 16px; background: #1e293b; border: 1px solid #475569; border-radius: 8px; cursor: pointer; position: relative; }
+  .hover-area:hover { border-color: #60a5fa; background: #1e3a5f; }
+  .hover-area:hover::after { content: "툴팁!"; position: absolute; left: 50%; top: -32px; transform: translateX(-50%); background: #fbbf24; color: #422006; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+
+  #click-target { padding: 22px 30px; background: #38bdf8; color: #082f49; border: 0; border-radius: 12px; font-size: 16px; font-weight: 800; cursor: pointer; position: relative; }
+  .click-mark { position: fixed; width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; box-shadow: 0 0 6px #f59e0b; transform: translate(-50%,-50%); pointer-events: none; z-index: 998; }
+
+  .drag-board { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .drop-zone { border: 2px dashed #475569; border-radius: 8px; padding: 12px; min-height: 84px; }
+  .drop-zone.over { border-color: #60a5fa; background: rgba(96,165,250,0.15); }
+  .drop-zone-label { color: #64748b; font-size: 12px; margin-bottom: 8px; }
+  .card { background: #fbbf24; color: #422006; padding: 10px 14px; border-radius: 6px; font-weight: 700; cursor: grab; user-select: none; }
+
+  .filler { background: linear-gradient(180deg,#1e293b,#0b1220); border: 1px solid #334155; border-radius: 12px; padding: 18px; }
+  .filler p { color: #94a3b8; margin: 0 0 12px; line-height: 1.7; }
+
+  #dot { position: fixed; width: 13px; height: 13px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 16px #ef4444; transform: translate(-50%,-50%); pointer-events: none; z-index: 999; left: -100px; top: -100px; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+  #log { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #cbd5e1; background: #020617; padding: 10px; border-radius: 8px; height: 96px; overflow: auto; line-height: 1.5; }
+  #log .k { color: #fcd34d; } #log .c { color: #86efac; } #log .m { color: #93c5fd; } #log .w { color: #f9a8d4; }
+  .container > * { position: relative; z-index: 2; }
 </style>
 </head>
 <body>
@@ -91,26 +47,51 @@
 <div id="dot"></div>
 
 <div class="container">
-  <h1>CDP Human Input Demo</h1>
+  <h1>CDP Human Input Demo v2 — 페르소나 · 오버슈트 · 분산 · 롤오버 · stealth</h1>
 
   <div class="panel">
-    <label for="ko">한글 입력 (IME 자모 조합)</label>
-    <textarea id="ko" placeholder="여기에 자모 단위로 조합되며 들어갑니다"></textarea>
+    <div class="row stat">
+      <div>persona <b id="p-seed">—</b></div>
+      <div>타/분 <b id="p-wpm">—</b></div>
+      <div>curviness <b id="p-curvy">—</b></div>
+      <div>overshoot <b id="p-over">—</b></div>
+      <div>typo <b id="p-typo">—</b></div>
+      <div>navigator.webdriver <b id="p-wd">—</b></div>
+    </div>
   </div>
 
   <div class="panel">
-    <label for="en">영문/숫자 (일반 keyDown)</label>
-    <input id="en" placeholder="여기는 영문 keyDown 경로" />
-  </div>
-
-  <div class="panel" style="display:flex; gap:12px; align-items:center;">
-    <button id="target">클릭 타겟</button>
-    <span id="clicked" style="font-size:13px; color:#94a3b8;"></span>
+    <label for="ko">한글 (IME 자모 조합)</label>
+    <textarea id="ko" placeholder="자모 단위로 조합되며 들어갑니다"></textarea>
   </div>
 
   <div class="panel">
-    <label>이벤트 로그 (keydown / composition*)</label>
-    <div id="log"></div>
+    <label for="en">영문 (롤오버 + 오타 정정)</label>
+    <input id="en" placeholder="영문 keyDown 경로" />
+  </div>
+
+  <div class="row">
+    <div class="panel"><h2>호버</h2><div class="hover-area" id="hover-btn">호버하면 툴팁</div></div>
+    <div class="panel">
+      <h2>클릭 분산 (같은 버튼 여러 번)</h2>
+      <button id="click-target">CLICK <span id="click-count">0</span></button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>드래그 (카드 → Zone B)</h2>
+    <div class="drag-board">
+      <div class="drop-zone" id="zone-a"><div class="drop-zone-label">Zone A</div><div class="card" id="card1">카드 1</div></div>
+      <div class="drop-zone" id="zone-b"><div class="drop-zone-label">Zone B</div></div>
+    </div>
+  </div>
+
+  <div class="panel"><h2>이벤트 로그</h2><div id="log"></div></div>
+
+  <div class="filler">
+    <h2>↓ 휠 스크롤 영역 ↓</h2>
+    <p>여러 tick으로 가속·감속하며 스크롤하고, 간격은 로그정규로 흔들립니다.</p>
+    <p>...</p><p>...</p><p>...</p><p>중간 지점.</p><p>...</p><p>...</p><p>목적지 근처.</p><p>시연 완료.</p>
   </div>
 </div>
 
@@ -124,48 +105,76 @@
     c.width = innerWidth * devicePixelRatio;
     c.height = innerHeight * devicePixelRatio;
     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-    ctx.strokeStyle = "rgba(96, 165, 250, 0.75)";
-    ctx.lineWidth = 2.5;
-    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(96,165,250,0.75)"; ctx.lineWidth = 2; ctx.lineCap = "round";
   }
-  resize();
-  addEventListener("resize", resize);
+  resize(); addEventListener("resize", resize);
 
   let last = null;
   addEventListener("mousemove", (e) => {
-    dot.style.left = e.clientX + "px";
-    dot.style.top = e.clientY + "px";
-    if (last) {
-      ctx.beginPath();
-      ctx.moveTo(last.x, last.y);
-      ctx.lineTo(e.clientX, e.clientY);
-      ctx.stroke();
-    }
+    dot.style.left = e.clientX + "px"; dot.style.top = e.clientY + "px";
+    if (last) { ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(e.clientX, e.clientY); ctx.stroke(); }
     last = { x: e.clientX, y: e.clientY };
   });
+  addEventListener("scroll", () => { ctx.clearRect(0,0,innerWidth,innerHeight); last = null; });
 
   function addLog(msg, cls) {
     const line = document.createElement("div");
     if (cls) line.className = cls;
-    line.textContent = msg;
-    log.appendChild(line);
+    line.textContent = msg; log.appendChild(line);
     log.scrollTop = log.scrollHeight;
     if (log.childElementCount > 200) log.firstChild.remove();
   }
-
   for (const el of document.querySelectorAll("input,textarea")) {
-    el.addEventListener("compositionstart", () => addLog(`[${el.id}] compositionstart`, "c"));
     el.addEventListener("compositionupdate", (e) => addLog(`[${el.id}] compositionupdate "${e.data}"`, "c"));
     el.addEventListener("compositionend", (e) => addLog(`[${el.id}] compositionend "${e.data}"`, "c"));
     el.addEventListener("keydown", (e) => addLog(`[${el.id}] keydown code=${e.code} key="${e.key}" kc=${e.keyCode}`, "k"));
   }
+  addEventListener("wheel", (e) => addLog(`wheel deltaY=${e.deltaY.toFixed(0)}`, "w"), { passive: true });
 
-  const btn = document.getElementById("target");
-  btn.addEventListener("click", () => {
-    btn.classList.add("hit");
-    document.getElementById("clicked").textContent = "clicked @ " + new Date().toLocaleTimeString();
-    setTimeout(() => btn.classList.remove("hit"), 600);
+  // 클릭 위치 마커 (분산 시각화)
+  const ct = document.getElementById("click-target");
+  const cc = document.getElementById("click-count");
+  let clicks = 0;
+  ct.addEventListener("click", (e) => {
+    clicks++; cc.textContent = clicks;
+    const m = document.createElement("div");
+    m.className = "click-mark"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
+    document.body.appendChild(m);
+    addLog(`click #${clicks} @ (${e.clientX},${e.clientY})`, "m");
   });
+
+  const hoverBtn = document.getElementById("hover-btn");
+  hoverBtn.addEventListener("mouseenter", () => addLog("hover: enter", "m"));
+  hoverBtn.addEventListener("mouseleave", () => addLog("hover: leave", "m"));
+
+  // mouse 이벤트 기반 드래그
+  const card = document.getElementById("card1"), zoneA = document.getElementById("zone-a"), zoneB = document.getElementById("zone-b");
+  let dragging = null;
+  card.addEventListener("mousedown", (e) => {
+    const r = card.getBoundingClientRect();
+    dragging = { ox: e.clientX - r.left, oy: e.clientY - r.top };
+    card.style.position = "fixed"; card.style.zIndex = 1000;
+    card.style.left = r.left + "px"; card.style.top = r.top + "px"; card.style.pointerEvents = "none";
+  });
+  addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    card.style.left = (e.clientX - dragging.ox) + "px"; card.style.top = (e.clientY - dragging.oy) + "px";
+    const over = document.elementFromPoint(e.clientX, e.clientY);
+    zoneA.classList.toggle("over", !!over && zoneA.contains(over));
+    zoneB.classList.toggle("over", !!over && zoneB.contains(over));
+  });
+  addEventListener("mouseup", (e) => {
+    if (!dragging) return;
+    const over = document.elementFromPoint(e.clientX, e.clientY);
+    const t = (over && zoneB.contains(over)) ? zoneB : (over && zoneA.contains(over)) ? zoneA : null;
+    if (t) { t.appendChild(card); card.style.position=""; card.style.left=card.style.top=""; card.style.zIndex=""; card.style.pointerEvents=""; addLog(`drag: dropped on ${t.id}`, "m"); }
+    zoneA.classList.remove("over"); zoneB.classList.remove("over"); dragging = null;
+  });
+
+  // webdriver 상태 표시
+  const wd = document.getElementById("p-wd");
+  wd.textContent = String(navigator.webdriver);
+  wd.className = navigator.webdriver ? "bad" : "ok";
 </script>
 </body>
 </html>
