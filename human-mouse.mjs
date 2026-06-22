@@ -71,18 +71,65 @@ async function emitMove(send, x, y, button = "none") {
 // selector → 좌표 / bbox
 // ============================================================
 
-export async function getElementBox(send, selector) {
-  const { result } = await send("Runtime.evaluate", {
-    expression: `(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el) throw new Error("element not found: " + ${JSON.stringify(selector)});
-      const r = el.getBoundingClientRect();
-      return { x: r.left, y: r.top, width: r.width, height: r.height,
-               cx: r.left + r.width/2, cy: r.top + r.height/2 };
-    })()`,
-    returnByValue: true,
-  });
-  return result.value;
+/**
+ * 요소가 나타날 때까지 폴링한다. timeoutMs 안에 못 찾으면 throw.
+ * SPA에서 아직 렌더되지 않은 요소를 기다릴 때.
+ */
+export async function waitForSelector(send, selector, opts = {}) {
+  const timeoutMs  = opts.timeoutMs  ?? 5000;
+  const intervalMs = opts.intervalMs ?? 100;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { result } = await send("Runtime.evaluate", {
+      expression: `!!document.querySelector(${JSON.stringify(selector)})`,
+      returnByValue: true,
+    });
+    if (result.value) return true;
+    if (Date.now() >= deadline) throw new Error(`waitForSelector timeout(${timeoutMs}ms): ${selector}`);
+    await sleep(intervalMs);
+  }
+}
+
+/**
+ * selector → bbox. 기본으로 요소 등장을 대기(wait)하고, 뷰포트 밖이면
+ * 사람처럼 휠로 스크롤해 들여놓은 뒤(scroll) 좌표를 다시 측정한다.
+ * @param {object} [opts]
+ * @param {boolean} [opts.wait=true]      요소 등장까지 폴링
+ * @param {boolean} [opts.scroll=true]    뷰포트 밖이면 humanWheel로 들여놓기
+ * @param {number}  [opts.timeoutMs=5000] wait 타임아웃
+ */
+export async function getElementBox(send, selector, opts = {}) {
+  const wait   = opts.wait   ?? true;
+  const scroll = opts.scroll ?? true;
+  if (wait) await waitForSelector(send, selector, opts);
+
+  const measure = async () => {
+    const { result } = await send("Runtime.evaluate", {
+      expression: `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) throw new Error("element not found: " + ${JSON.stringify(selector)});
+        const r = el.getBoundingClientRect();
+        return { x: r.left, y: r.top, width: r.width, height: r.height,
+                 cx: r.left + r.width/2, cy: r.top + r.height/2,
+                 vw: window.innerWidth, vh: window.innerHeight,
+                 inView: r.top >= 0 && r.left >= 0 &&
+                         r.bottom <= window.innerHeight && r.right <= window.innerWidth };
+      })()`,
+      returnByValue: true,
+    });
+    return result.value;
+  };
+
+  let box = await measure();
+  if (scroll && !box.inView) {
+    // 요소 중앙을 뷰포트 중앙 근처로 — 순간이동(scrollIntoView) 대신 사람처럼 휠 스크롤
+    const deltaY = Math.round(box.cy - box.vh / 2);
+    if (Math.abs(deltaY) > 4) {
+      await humanWheel(send, deltaY);
+      box = await measure(); // 스크롤 후 좌표 재측정
+    }
+  }
+  return box;
 }
 
 export async function getElementCenter(send, selector) {
@@ -130,8 +177,11 @@ async function moveLeg(send, start, end, duration, button, opts = {}) {
 
   const curvy = p.mouse.curviness * (opts.curveScale ?? 1);
   const sign  = p.rng.bool() ? -1 : 1;
-  const swing = (40 + p.rng.range(0, 120) * curvy) * sign;
-  const perpBias = p.rng.range(40, 130) * curvy;
+  // 곡률 진폭은 거리에 비례해 상한을 둔다 — 짧은 이동에서 과도하게 휘지 않게.
+  const swingCap = dist * 0.28;
+  const biasCap  = dist * 0.22;
+  const swing = clamp(40 + p.rng.range(0, 120) * curvy, 0, swingCap) * sign;
+  const perpBias = clamp(p.rng.range(40, 130) * curvy, 0, biasCap);
 
   const cp1 = {
     x: start.x + dx * 0.33 + swing,
