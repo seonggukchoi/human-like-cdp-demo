@@ -13,13 +13,14 @@ CDP(Chrome DevTools Protocol)로 마우스·키보드 입력을 사람처럼 흉
 | `human-keyboard.mjs` | ASCII 키 입력·한글 IME 자모 조합·특수 키·롤오버·자연 간격 |
 | `demo.html` / `demo.mjs` | 통합 시연 (입력·호버·클릭 분산·드래그·스크롤) |
 | `AGENTS.md` | 모듈을 사용하는 AI 에이전트용 레퍼런스 |
+| `test/` · `bench.mjs` | node:test 단위 테스트(자모 분해·분포·재현성) / 타이핑 속도(타·분) 회귀 측정 |
 
 ## 핵심 아이디어
 
 - **페르소나**: 세션 = 한 사람. 모든 동작이 한 시드에서 파생된 일관된 성향(속도·곡선·오타율·리듬)을 공유한다. `createPersona(seed)`로 재현 가능.
 - **분포**: 균등분포 대신 로그정규(간격)와 AR(1)(리듬, 자기상관)을 사용 — 히스토그램이 사람에 가깝다.
-- **마우스**: 베지어 곡선 + 양 끝 taper 노이즈 + 가변 속도에 더해, 목표를 살짝 지나쳤다 보정하는 오버슈트(submovement), 정수 좌표(중복 스킵), 클릭 위치 가우시안 분산, press 중 드리프트.
-- **한글**: 두벌식 자모 단위로 `Input.imeSetComposition` → `Input.insertText`. keydown은 IME 표준 패턴(`keyCode: 229`, `key: "Process"`).
+- **마우스**: 베지어 곡선 + 양 끝 taper 노이즈 + 가변 속도에 더해, 목표를 살짝 지나쳤다 보정하는 오버슈트(submovement), 거리 대비 곡률 상한, 정수 좌표(중복 스킵), 클릭 위치 가우시안 분산, press 중 드리프트. selector를 받는 동작은 요소 등장을 기다리고 화면 밖이면 휠로 자동 스크롤한다.
+- **한글**: 두벌식 자모 단위로 `Input.imeSetComposition` → `Input.insertText`. keydown은 IME 표준 패턴(`keyCode: 229`, `key: "Process"`). 오타(인접 자모) → 백스페이스 → 정타도 지원.
 - **타이핑 속도**: 분당 타수(`strokesPerMin`) 기반. 기본 페르소나는 약 400~500타/분(한국식 "타", 영문 1글자=1타·한글 자모 1개=1타).
 - **stealth**: 입력이 자연스러워도 `navigator.webdriver=true`면 무의미. 1차 신호를 가린다(만능 아님 — 아래 한계 참고).
 
@@ -30,6 +31,8 @@ npm install
 npx playwright install chromium
 node demo.mjs
 ```
+
+테스트는 `npm test`(자모 분해·분포·재현성), 타이핑 속도 측정은 `npm run bench`(목표 400~500 타/분).
 
 Chromium 창이 떠서 한글/영문 입력 → 호버 → 클릭 분산 → 드래그앤드롭 → 휠 스크롤이 자동 진행된다. 상단 패널에 이번 세션 페르소나(시드·타/분·곡선·오버슈트·오타율)와 `navigator.webdriver` 상태가 표시된다.
 
