@@ -1,8 +1,17 @@
 {
-  "name": "cdp-demo",
+  "name": "human-like-cdp-demo",
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "description": "CDP(Chrome DevTools Protocol)로 마우스·키보드 입력을 사람처럼 흉내내는 ES 모듈과 통합 시연",
+  "scripts": {
+    "test": "node --test",
+    "bench": "node bench.mjs",
+    "demo": "node demo.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "playwright": "^1.60.0"
   }
