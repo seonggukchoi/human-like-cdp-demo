@@ -178,6 +178,45 @@ function neighborTypo(rng, ch) {
   return ch === ch.toUpperCase() ? pick.toUpperCase() : pick;
 }
 
+// 두벌식 자판에서 물리적으로 인접한 초성/중성(한글 오타용)
+const CHO_NEIGHBOR = {
+  "ㅂ":"ㅈ", "ㅈ":"ㅂㄷ", "ㄷ":"ㅈㄱ", "ㄱ":"ㄷㅅ", "ㅅ":"ㄱ",
+  "ㅁ":"ㄴ", "ㄴ":"ㅁㅇ", "ㅇ":"ㄴㄹ", "ㄹ":"ㅇㅎ", "ㅎ":"ㄹ",
+  "ㅋ":"ㅌ", "ㅌ":"ㅋㅊ", "ㅊ":"ㅌㅍ", "ㅍ":"ㅊ",
+};
+const JUNG_NEIGHBOR = {
+  "ㅛ":"ㅕ", "ㅕ":"ㅛㅑ", "ㅑ":"ㅕㅐ", "ㅐ":"ㅑㅔ", "ㅔ":"ㅐ",
+  "ㅗ":"ㅓ", "ㅓ":"ㅗㅏ", "ㅏ":"ㅓㅣ", "ㅣ":"ㅏ",
+  "ㅠ":"ㅜ", "ㅜ":"ㅠㅡ", "ㅡ":"ㅜ",
+};
+
+/**
+ * 한글 음절의 초성 또는 중성 하나를 두벌식 인접 자모로 바꿔 "오타 음절"을 만든다.
+ * 복합 모음/받침 등 인접맵에 없으면 null(오타 생략).
+ */
+function hangulTypoSyllable(rng, syllable) {
+  const code = syllable.charCodeAt(0) - HANGUL_BASE;
+  let cho  = Math.floor(code / 588);
+  let jung = Math.floor((code % 588) / 28);
+  const jong = code % 28;
+
+  if (rng.bool()) {
+    const cand = CHO_NEIGHBOR[CHO[cho]];
+    if (!cand) return null;
+    const idx = CHO.indexOf(cand[Math.floor(rng.next() * cand.length)]);
+    if (idx < 0) return null;
+    cho = idx;
+  } else {
+    const cand = JUNG_NEIGHBOR[JUNG[jung]];
+    if (!cand) return null;
+    const idx = JUNG.indexOf(cand[Math.floor(rng.next() * cand.length)]);
+    if (idx < 0) return null;
+    jung = idx;
+  }
+  const wrong = String.fromCharCode(HANGUL_BASE + cho * 588 + jung * 28 + jong);
+  return wrong === syllable ? null : wrong;
+}
+
 // ============================================================
 // 저수준 키 이벤트
 // ============================================================
@@ -291,7 +330,7 @@ function gapAfter(p, ch) {
   else if (/[,;:)]/.test(ch)) delay *= (1 + (p.keyboard.punctPause - 1) * 0.5);
   if (/[0-9]/.test(ch))      delay *= 1.25;           // 숫자열은 느림
   if (SHIFTED[ch] || SYM[ch]) delay *= 1.15;          // 기호도 느림
-  if (ch === " ")            delay *= 1.05;
+  if (ch === " ")            delay *= p.keyboard.spaceBurst; // 단어 사이 호흡(burst-pause)
   if (p.rng.bool(p.keyboard.pauseChance)) delay += p.rng.logNormal(600, 0.4, 280, 1400);
   return delay;
 }
@@ -322,6 +361,16 @@ export async function humanType(send, text, opts = {}) {
     // ── 한글 ──
     if (isHangulSyllable(ch)) {
       await flushPending();
+      // 한글 오타: 인접 자모로 잘못 친 음절 → 인지 → 백스페이스(음절 삭제) → 정타
+      if (typoChance > 0 && p.rng.bool(typoChance * 0.7)) {
+        const wrong = hangulTypoSyllable(p.rng, ch);
+        if (wrong) {
+          await typeHangulSyllable(send, wrong);
+          await sleep(p.rng.logNormal(340, 0.4, 160, 720)); // 알아챔
+          await pressKey(send, "Backspace");
+          await sleep(p.rng.logNormal(120, 0.4, 50, 280));
+        }
+      }
       await typeHangulSyllable(send, ch);
       await sleep(gapAfter(p, ch));
       continue;

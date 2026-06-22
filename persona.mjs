@@ -61,6 +61,8 @@ export function createPersona(seed) {
     pauseChance: r(0.015, 0.05),
     // 구두점 뒤 추가 호흡 배율
     punctPause: r(1.4, 2.4),
+    // 단어 사이(공백) 호흡 배율 — burst-pause 패턴
+    spaceBurst: r(1.3, 1.7),
   };
 
   // ── 행동(고수준) 성향 ────────────────────────
