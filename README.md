@@ -1,4 +1,4 @@
-# human-like-cdp-demo
+# human-control.js
 
 CDP(Chrome DevTools Protocol)로 마우스·키보드 입력을 사람처럼 흉내내는 ES 모듈과 통합 시연.
 
